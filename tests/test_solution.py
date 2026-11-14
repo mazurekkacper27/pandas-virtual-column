@@ -51,6 +51,20 @@ def test_single_column_is_copied(numbers: pd.DataFrame) -> None:
     assert result["d"].tolist() == [4, 5, 6]
 
 
+def test_long_role(numbers: pd.DataFrame) -> None:
+    result = add_virtual_column(numbers, " + ".join(["a"] * 100), "d")
+
+    assert result["d"].tolist() == [100, 200, 300]
+
+
+def test_label_can_be_just_an_underscore() -> None:
+    df = pd.DataFrame({"_": [3], "a": [2]})
+
+    result = add_virtual_column(df, "_*a", "b")
+
+    assert result["b"].tolist() == [6]
+
+
 def test_works_with_floats() -> None:
     lines = pd.DataFrame({"quantity": [2, 3], "unit_price": [9.5, 0.25], "discount": [1.0, 0.0]})
 
@@ -128,6 +142,14 @@ def test_ambiguous_column_gives_an_empty_frame(caplog: pytest.LogCaptureFixture)
         "a + label3",
         "a + label&one",
         "a + b_",
+        "+",
+        "*",
+        "a - - b",
+        "a * * b",
+        "a.b",
+        "a, b",
+        "a + b;",
+        "a = b",
     ],
 )
 def test_invalid_role_gives_an_empty_frame(numbers: pd.DataFrame, role: str) -> None:

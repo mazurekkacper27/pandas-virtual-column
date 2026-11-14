@@ -2,14 +2,17 @@
 
 Run it with ``uv run python pipeline.py``. It reads ``sales.csv`` next to this file
 and writes ``revenue_by_region.csv``. Each fix logs how many rows it touched, so
-the output doubles as a short data-quality report.
+the output doubles as a short data-quality report. Values that can't be fixed
+without guessing stop the pipeline with a ``ValueError``.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
@@ -22,7 +25,18 @@ SALES_CSV = HERE / "sales.csv"
 REVENUE_CSV = HERE / "revenue_by_region.csv"
 
 REVENUE_ROLE = "quantity * unit_price - discount"
-ORDER_ID = r"SO-\d+"
+
+# A whole number, optionally negative, where a space may separate groups of three digits.
+QUANTITY = r"-?(?:\d{1,3}(?: \d{3})+|\d+)"
+# An amount of money, with a decimal dot or a decimal comma.
+AMOUNT = r"-?\d+(?:[.,]\d+)?"
+
+
+def require(valid: pd.Series[bool], values: pd.Series[Any], problem: str) -> None:
+    """Raise a ValueError that names a few of the values that aren't valid."""
+    if not valid.all():
+        examples = ", ".join(repr(value) for value in values[~valid].head(5))
+        raise ValueError(f"{problem}: {examples}")
 
 
 def load_sales(path: Path) -> pd.DataFrame:
@@ -68,24 +82,38 @@ def normalize_regions(sales: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_quantities(sales: pd.DataFrame) -> pd.DataFrame:
-    """Remove thousands separators ("1 762" becomes 1762) and convert to integers.
+    """Read whole quantities, where a space may separate thousands ("1 762" is 1762).
 
-    Negative quantities are returns. They stay negative, so they reduce revenue.
+    Anything else, such as "3.9" or "1.762", stops the pipeline instead of being
+    rounded. Negative quantities are returns. They stay negative, so they reduce
+    revenue.
     """
     text = sales["quantity"].str.strip()
-    has_separator = text.str.contains(r"\d\s+\d", na=False)
-    quantities = pd.to_numeric(text.str.replace(r"\s+", "", regex=True)).astype("int64")
+    require(text.str.fullmatch(QUANTITY, na=False), text, "Quantity is not a whole number")
+    has_separator = text.str.contains(" ", regex=False)
+    try:
+        quantities = pd.to_numeric(text.str.replace(" ", "", regex=False)).astype("int64")
+    except OverflowError:
+        raise ValueError("Quantity is too large to store") from None
     logger.info("Removed a thousands separator from the quantity in %d row(s)", has_separator.sum())
     logger.info("Kept %d row(s) with a negative quantity as returns", quantities.lt(0).sum())
     return sales.assign(quantity=quantities)
 
 
 def to_amount(values: pd.Series[str]) -> pd.Series[float]:
-    """Parse money written with a decimal dot ("39.90") or a decimal comma ("39,90")."""
+    """Parse money written with a decimal dot ("39.90") or a decimal comma ("39,90").
+
+    Empty cells stay missing. Anything else, such as "inf" or "1e3", stops the pipeline.
+    """
     text = values.str.strip()
+    is_amount = text.isna() | text.str.fullmatch(AMOUNT, na=False)
+    require(is_amount, text, f"{values.name} is not an amount of money")
     has_comma = text.str.contains(",", regex=False, na=False)
     logger.info("Read a decimal comma in %s in %d row(s)", values.name, has_comma.sum())
-    return pd.to_numeric(text.str.replace(",", ".", regex=False)).astype("float64")
+    try:
+        return pd.to_numeric(text.str.replace(",", ".", regex=False)).astype("float64")
+    except OverflowError:
+        raise ValueError(f"{values.name} is too large to store") from None
 
 
 def parse_unit_prices(sales: pd.DataFrame) -> pd.DataFrame:
@@ -93,20 +121,19 @@ def parse_unit_prices(sales: pd.DataFrame) -> pd.DataFrame:
 
 
 def fill_missing_unit_prices(sales: pd.DataFrame) -> pd.DataFrame:
-    """Fill a missing unit price with the list price of the product.
+    """Fill a missing unit price with the price on the product's other lines.
 
-    The list price is the price the product is most often sold at. In this export
-    every product is sold at exactly one price, so the filled value matches all the
-    other lines of that product.
+    That only works when all those lines have the same price. If the product is
+    sold at several prices, or has no price anywhere, there is nothing to copy
+    and the pipeline stops.
     """
-    list_prices = (
-        sales.dropna(subset=["unit_price"])
-        .groupby("product")["unit_price"]
-        .agg(lambda prices: prices.mode().iloc[0])
-    )
     missing = sales["unit_price"].isna()
-    logger.info("Filled the unit price from the list price in %d row(s)", missing.sum())
-    return sales.assign(unit_price=sales["unit_price"].fillna(sales["product"].map(list_prices)))
+    known_prices = sales[~missing].groupby("product")["unit_price"]
+    single_prices = known_prices.first()[known_prices.nunique() == 1]
+    can_fill = ~missing | sales["product"].isin(single_prices.index)
+    require(can_fill, sales["product"], "No single unit price to copy for product")
+    logger.info("Copied the unit price from the product's other lines in %d row(s)", missing.sum())
+    return sales.assign(unit_price=sales["unit_price"].fillna(sales["product"].map(single_prices)))
 
 
 def parse_discounts(sales: pd.DataFrame) -> pd.DataFrame:
@@ -125,8 +152,9 @@ def parse_order_dates(sales: pd.DataFrame) -> pd.DataFrame:
 def drop_duplicate_lines(sales: pd.DataFrame) -> pd.DataFrame:
     """Drop order lines that were exported twice.
 
-    It runs after the values are normalized, so it also catches copies that only
-    differed in formatting.
+    An order can have several lines, so lines are compared on all their values,
+    not on the order ID. This runs after the values are normalized, so it also
+    catches copies that only differed in formatting.
     """
     is_copy = sales.duplicated()
     logger.info("Dropped %d duplicated line(s)", is_copy.sum())
@@ -134,16 +162,21 @@ def drop_duplicate_lines(sales: pd.DataFrame) -> pd.DataFrame:
 
 
 def check_clean(sales: pd.DataFrame) -> pd.DataFrame:
-    """Stop on what the steps above couldn't fix: gaps, malformed or repeated order ids."""
-    problems = []
+    """Stop on values that are still missing or make no sense for an order line."""
     if columns_with_gaps := [str(name) for name in sales.columns[sales.isna().any()]]:
-        problems.append(f"missing values in {', '.join(columns_with_gaps)}")
-    if not sales["order_id"].str.fullmatch(ORDER_ID).all():
-        problems.append("malformed order ids")
-    if sales["order_id"].duplicated().any():
-        problems.append("order ids shared by different lines")
-    if problems:
-        raise ValueError("Sales data is still not clean: " + "; ".join(problems))
+        raise ValueError(f"Missing values in {', '.join(columns_with_gaps)}")
+    require(sales["unit_price"].ge(0), sales["unit_price"], "Negative unit price")
+    require(sales["discount"].ge(0), sales["discount"], "Negative discount")
+    is_return = sales["quantity"].lt(0)
+    gross = sales["quantity"] * sales["unit_price"]
+    require(
+        ~is_return | sales["discount"].eq(0), sales["order_id"], "Discount on a return in order"
+    )
+    require(
+        is_return | sales["discount"].le(gross),
+        sales["order_id"],
+        "Discount larger than the line's value in order",
+    )
     return sales
 
 
@@ -167,6 +200,8 @@ def add_revenue(sales: pd.DataFrame) -> pd.DataFrame:
     with_revenue = add_virtual_column(sales, REVENUE_ROLE, "revenue")
     if "revenue" not in with_revenue.columns:
         raise ValueError(f"Cannot compute revenue as {REVENUE_ROLE!r}")
+    is_finite = with_revenue["revenue"].abs().lt(math.inf)  # false for inf and NaN
+    require(is_finite, with_revenue["order_id"], "Revenue is not a finite number in order")
     return with_revenue
 
 

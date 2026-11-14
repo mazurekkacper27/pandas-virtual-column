@@ -33,12 +33,16 @@ Normalized the region in 15 row(s)
 Removed a thousands separator from the quantity in 4 row(s)
 Kept 6 row(s) with a negative quantity as returns
 Read a decimal comma in unit_price in 7 row(s)
-Filled the unit price from the list price in 4 row(s)
+Copied the unit price from the product's other lines in 4 row(s)
 Read a decimal comma in discount in 0 row(s)
 Set an empty discount to 0 in 963 row(s)
 Dropped 5 duplicated line(s)
 Wrote the revenue of 5 regions to revenue_by_region.csv
 ```
+
+If a value can't be fixed without guessing, the pipeline stops with a `ValueError`. The error
+says what's wrong and shows a few of the values. The report is only written when every check
+passes.
 
 ## Layout
 
@@ -105,26 +109,43 @@ catches it, logs the reason as a warning and returns an empty DataFrame, as the 
   have to go. I still lowercase the headers as well (`Unit Price` becomes `unit_price`). The
   revenue rule refers to the columns by fixed names, and this way it keeps working if a later
   export changes the case of a header.
-- Each line of `sales.csv` is one order line, and the order ID identifies it. The IDs run from
-  SO-10001 to SO-11500 without gaps. Each appears once, except for five that appear twice with
-  identical values, so those lines were exported twice.
+- Each line of `sales.csv` is one order line. An order can have several lines, so the order ID
+  doesn't identify a line by itself. A line is a duplicate only when all its values match
+  another line. The file has no line numbers, so two identical lines of one order can't be told
+  apart from a line exported twice. Such a pair is treated as one line exported twice. In
+  `sales.csv` the order IDs run from SO-10001 to SO-11500 without gaps. Each appears once, except
+  for five that appear twice with identical values.
 - The task says not to drop rows that can be fixed. The pipeline only drops rows that aren't order
   lines (the repeated header and the `TOTAL` footer) and the second copy of a duplicated line.
   Every other row is kept, and fixed where needed.
+- Quantities must be whole numbers. A space may separate groups of three digits (`1 762`), and a
+  leading minus marks a return. Anything else, such as `3.9`, `1.762` or `1e3`, stops the
+  pipeline instead of being rounded. A dot or a comma isn't accepted as a thousands separator,
+  because in prices they mark the decimals.
 - A negative quantity is a return. It stays negative, so it lowers the region's revenue.
 - `1 762` is 1762 with a space as the thousands separator. These four quantities are much larger
   than the other positive quantities (1 to 40), so they look like bulk orders. I kept them, but
   they would be worth confirming with whoever owns the data, because they add about 324k to the
   totals.
-- A missing unit price is the product's list price. That's the price the product is most often
-  sold at, and in this file every product has exactly one price.
+- Prices and discounts are plain decimals with a dot or a comma (`39.90`, `39,90`). Values like
+  `inf`, `nan` or `1e3` stop the pipeline.
+- A missing unit price is copied from the product's other lines, but only when they all have the
+  same price. If the product is sold at several prices or has no price anywhere, there is no safe
+  value to copy, so the pipeline stops. In `sales.csv` every product has exactly one price.
+- The task doesn't limit the values, so I only reject what contradicts its description: a
+  negative unit price, a negative discount, and a discount larger than the line's value. The
+  discount is an amount taken off the line, so it can't be more than the line is worth. A price
+  of 0, and a discount equal to the whole line, are allowed.
+- A discount on a return stops the pipeline. The task doesn't say which sign such a discount
+  would have, and `sales.csv` has none, so I didn't guess.
 - Revenue isn't rounded per line. Region totals are rounded to cents and sorted by region name.
+  The amounts are floats. For `sales.csv` the region totals are identical to an exact decimal
+  calculation, so I didn't add `Decimal`.
 - The order date isn't needed for the report, but it is still parsed and checked.
-- Some problems can't be fixed without guessing, so they stop the pipeline with an error: a
-  quantity, price, discount or date that can't be parsed, a value still missing after cleaning
-  (such as the price of a product that never has one), a malformed order ID, or one order ID on
-  different lines. That's safer than changing the totals without anyone noticing. It doesn't
-  catch everything, though. A misspelled region, for example, would get through.
+- Anything that can't be fixed without guessing stops the pipeline with a `ValueError`. That
+  covers a value in an unknown format, a value still missing after cleaning, a price that can't
+  be copied, a value that makes no sense (see above), and a revenue that isn't a finite number.
+  The checks don't catch everything, though. A misspelled region, for example, would get through.
 
 ## Problems found in `sales.csv`
 
@@ -139,7 +160,7 @@ The file has 1507 lines under the header. Line numbers count the header as line 
 | Quantity with a space as the thousands separator: `1 762`, `1 745`, `1 371`, `1 427` (SO-10251, SO-10734, SO-11088, SO-11312) | 4 | Separator removed |
 | Negative quantity, -2 to -5 (SO-10421, SO-10515, SO-10779, SO-11011, SO-11289, SO-11445) | 6 | Kept as returns |
 | Unit price with a decimal comma, like `"39,90"` (SO-10137, SO-10402, SO-10688, SO-10911, SO-11203, SO-11377, SO-11460) | 7 | Comma read as the decimal point |
-| Missing unit price (SO-10610, SO-11099 Printer paper; SO-11350, SO-11477 Keyboard) | 4 | Filled with the product's list price (21.00 and 89.00) |
+| Missing unit price (SO-10610, SO-11099 Printer paper; SO-11350, SO-11477 Keyboard) | 4 | Copied from the product's other lines, which all have the same price (21.00 and 89.00) |
 | Lines exported twice (SO-10305, SO-10822, SO-10966, SO-11240, SO-11405) | 5 | Second copy dropped |
 
 That leaves 1500 order lines. Products and dates were already clean: 8 product names and valid
