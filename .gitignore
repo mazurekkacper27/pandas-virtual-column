@@ -1,0 +1,26 @@
+# Task specifications (not included in repository)
+task-virtual-column.*
+test_virtual_column 1.py
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS files
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
