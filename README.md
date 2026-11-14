@@ -23,10 +23,11 @@ uv run mypy                 # strict type check
 uv run ruff check .         # lint
 ```
 
-The pipeline logs how many rows each fix touched:
+The pipeline logs how many rows, or cells, each fix touched:
 
 ```text
 Read 1507 lines from sales.csv
+Treated 0 blank cell(s) as empty
 Dropped 1 repeated header row(s)
 Dropped 1 TOTAL row(s)
 Normalized the region in 15 row(s)
@@ -115,20 +116,27 @@ catches it, logs the reason as a warning and returns an empty DataFrame, as the 
   apart from a line exported twice. Such a pair is treated as one line exported twice. In
   `sales.csv` the order IDs run from SO-10001 to SO-11500 without gaps. Each appears once, except
   for five that appear twice with identical values.
+- The task doesn't define a format for order IDs, so the pipeline doesn't enforce one. It only
+  requires that every line has an order ID, as the task says. A pattern like `SO-` followed by
+  digits would come from this one file and could reject a valid export.
+- A cell with nothing but spaces counts as empty. A blank discount means no discount, and a blank
+  unit price is filled like a missing one. A line without an order ID, region, product, quantity
+  or order date stops the pipeline.
 - The task says not to drop rows that can be fixed. The pipeline only drops rows that aren't order
   lines (the repeated header and the `TOTAL` footer) and the second copy of a duplicated line.
   Every other row is kept, and fixed where needed.
 - Quantities must be whole numbers. A space may separate groups of three digits (`1 762`), and a
   leading minus marks a return. Anything else, such as `3.9`, `1.762` or `1e3`, stops the
   pipeline instead of being rounded. A dot or a comma isn't accepted as a thousands separator,
-  because in prices they mark the decimals.
+  because in prices they mark the decimals. A quantity also has to fit in a 64-bit integer,
+  so it can't silently wrap around to a negative number.
 - A negative quantity is a return. It stays negative, so it lowers the region's revenue.
 - `1 762` is 1762 with a space as the thousands separator. These four quantities are much larger
   than the other positive quantities (1 to 40), so they look like bulk orders. I kept them, but
   they would be worth confirming with whoever owns the data, because they add about 324k to the
   totals.
 - Prices and discounts are plain decimals with a dot or a comma (`39.90`, `39,90`). Values like
-  `inf`, `nan` or `1e3` stop the pipeline.
+  `inf`, `nan` or `1e3`, and amounts too large to store as a finite number, stop the pipeline.
 - A missing unit price is copied from the product's other lines, but only when they all have the
   same price. If the product is sold at several prices or has no price anywhere, there is no safe
   value to copy, so the pipeline stops. In `sales.csv` every product has exactly one price.
@@ -141,10 +149,12 @@ catches it, logs the reason as a warning and returns an empty DataFrame, as the 
 - Revenue isn't rounded per line. Region totals are rounded to cents and sorted by region name.
   The amounts are floats. For `sales.csv` the region totals are identical to an exact decimal
   calculation, so I didn't add `Decimal`.
-- The order date isn't needed for the report, but it is still parsed and checked.
+- The order date isn't needed for the report, but it is still checked. It must be a real date
+  written exactly as `YYYY-MM-DD`. `2026-1-5`, `05/01/2026` and `2026-02-30` stop the pipeline.
 - Anything that can't be fixed without guessing stops the pipeline with a `ValueError`. That
-  covers a value in an unknown format, a value still missing after cleaning, a price that can't
-  be copied, a value that makes no sense (see above), and a revenue that isn't a finite number.
+  covers a value in an unknown format, a number too large to store, a value still missing after
+  cleaning, a price that can't be copied, a value that makes no sense (see above), and a revenue
+  that isn't a finite number.
   The checks don't catch everything, though. A misspelled region, for example, would get through.
 
 ## Problems found in `sales.csv`

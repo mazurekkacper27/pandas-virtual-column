@@ -1,7 +1,7 @@
 """Clean the raw sales export and report the revenue of each region.
 
 Run it with ``uv run python pipeline.py``. It reads ``sales.csv`` next to this file
-and writes ``revenue_by_region.csv``. Each fix logs how many rows it touched, so
+and writes ``revenue_by_region.csv``. Each fix logs how many rows or cells it touched, so
 the output doubles as a short data-quality report. Values that can't be fixed
 without guessing stop the pipeline with a ``ValueError``.
 """
@@ -28,8 +28,10 @@ REVENUE_ROLE = "quantity * unit_price - discount"
 
 # A whole number, optionally negative, where a space may separate groups of three digits.
 QUANTITY = r"-?(?:\d{1,3}(?: \d{3})+|\d+)"
+INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
 # An amount of money, with a decimal dot or a decimal comma.
 AMOUNT = r"-?\d+(?:[.,]\d+)?"
+DATE = r"\d{4}-\d{2}-\d{2}"
 
 
 def require(valid: pd.Series[bool], values: pd.Series[Any], problem: str) -> None:
@@ -47,6 +49,14 @@ def load_sales(path: Path) -> pd.DataFrame:
     sales = pd.read_csv(path, dtype=str, keep_default_na=False, na_values=[""])
     logger.info("Read %d lines from %s", len(sales), path.name)
     return sales
+
+
+def empty_blank_cells(sales: pd.DataFrame) -> pd.DataFrame:
+    """Treat a cell with nothing but spaces like an empty cell."""
+    emptied = sales.replace(r"^\s+$", math.nan, regex=True)
+    blank_cells = emptied.isna().sum().sum() - sales.isna().sum().sum()
+    logger.info("Treated %d blank cell(s) as empty", blank_cells)
+    return emptied
 
 
 def drop_repeated_headers(sales: pd.DataFrame) -> pd.DataFrame:
@@ -85,16 +95,15 @@ def parse_quantities(sales: pd.DataFrame) -> pd.DataFrame:
     """Read whole quantities, where a space may separate thousands ("1 762" is 1762).
 
     Anything else, such as "3.9" or "1.762", stops the pipeline instead of being
-    rounded. Negative quantities are returns. They stay negative, so they reduce
-    revenue.
+    rounded, and so does a number that doesn't fit in 64 bits. Negative quantities
+    are returns. They stay negative, so they reduce revenue.
     """
     text = sales["quantity"].str.strip()
     require(text.str.fullmatch(QUANTITY, na=False), text, "Quantity is not a whole number")
+    numbers = text.str.replace(" ", "", regex=False).map(int)
+    require(numbers.between(INT64_MIN, INT64_MAX), text, "Quantity is too large to store")
+    quantities = numbers.astype("int64")
     has_separator = text.str.contains(" ", regex=False)
-    try:
-        quantities = pd.to_numeric(text.str.replace(" ", "", regex=False)).astype("int64")
-    except OverflowError:
-        raise ValueError("Quantity is too large to store") from None
     logger.info("Removed a thousands separator from the quantity in %d row(s)", has_separator.sum())
     logger.info("Kept %d row(s) with a negative quantity as returns", quantities.lt(0).sum())
     return sales.assign(quantity=quantities)
@@ -103,17 +112,19 @@ def parse_quantities(sales: pd.DataFrame) -> pd.DataFrame:
 def to_amount(values: pd.Series[str]) -> pd.Series[float]:
     """Parse money written with a decimal dot ("39.90") or a decimal comma ("39,90").
 
-    Empty cells stay missing. Anything else, such as "inf" or "1e3", stops the pipeline.
+    Empty cells stay missing. Anything else, such as "inf" or "1e3", stops the
+    pipeline, and so does an amount too large to store as a finite number.
     """
     text = values.str.strip()
     is_amount = text.isna() | text.str.fullmatch(AMOUNT, na=False)
     require(is_amount, text, f"{values.name} is not an amount of money")
+    amounts = text.str.replace(",", ".", regex=False).map(float, na_action="ignore")
+    amounts = amounts.astype("float64")
+    is_finite = amounts.isna() | amounts.abs().lt(math.inf)
+    require(is_finite, text, f"{values.name} is too large to store")
     has_comma = text.str.contains(",", regex=False, na=False)
     logger.info("Read a decimal comma in %s in %d row(s)", values.name, has_comma.sum())
-    try:
-        return pd.to_numeric(text.str.replace(",", ".", regex=False)).astype("float64")
-    except OverflowError:
-        raise ValueError(f"{values.name} is too large to store") from None
+    return amounts
 
 
 def parse_unit_prices(sales: pd.DataFrame) -> pd.DataFrame:
@@ -144,8 +155,15 @@ def parse_discounts(sales: pd.DataFrame) -> pd.DataFrame:
 
 
 def parse_order_dates(sales: pd.DataFrame) -> pd.DataFrame:
-    """Dates must be YYYY-MM-DD. Anything else stops the pipeline instead of being guessed."""
-    dates = pd.to_datetime(sales["order_date"].str.strip(), format="%Y-%m-%d")
+    """Dates must be real dates written as YYYY-MM-DD, such as 2026-01-05.
+
+    "2026-1-5", "05/01/2026" or "2026-02-30" stop the pipeline instead of being
+    guessed. A missing date is left for check_clean.
+    """
+    text = sales["order_date"].str.strip()
+    dates = pd.to_datetime(text, format="%Y-%m-%d", errors="coerce")
+    is_date = text.isna() | (text.str.fullmatch(DATE, na=False) & dates.notna())
+    require(is_date, text, "Order date is not a YYYY-MM-DD date")
     return sales.assign(order_date=dates)
 
 
@@ -182,7 +200,8 @@ def check_clean(sales: pd.DataFrame) -> pd.DataFrame:
 
 def clean_sales(raw: pd.DataFrame) -> pd.DataFrame:
     return (
-        raw.pipe(drop_repeated_headers)
+        raw.pipe(empty_blank_cells)
+        .pipe(drop_repeated_headers)
         .pipe(normalize_column_names)
         .pipe(drop_total_rows)
         .pipe(normalize_regions)

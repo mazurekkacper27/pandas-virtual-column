@@ -104,6 +104,23 @@ def test_parse_quantities_reads_whole_numbers_with_thousands_separators() -> Non
     assert result["quantity"].tolist() == [5, 1762, 12, -3, 1_000_000]
 
 
+def test_parse_quantities_accepts_the_int64_limits() -> None:
+    raw = text_frame({"quantity": [str(2**63 - 1), str(-(2**63))]})
+
+    result = pipeline.parse_quantities(raw)
+
+    assert result["quantity"].tolist() == [2**63 - 1, -(2**63)]
+
+
+@pytest.mark.parametrize(
+    "quantity",
+    [str(2**63), str(-(2**63) - 1), str(2**64 - 1), str(2**64), "9" * 30, "9" * 400],
+)
+def test_parse_quantities_rejects_numbers_outside_int64(quantity: str) -> None:
+    with pytest.raises(ValueError, match="Quantity is too large to store"):
+        pipeline.parse_quantities(text_frame({"quantity": ["5", quantity]}))
+
+
 @pytest.mark.parametrize(
     "quantity",
     ["3.9", "1.762", "1,762", "12 34 5", "1  762", "1e3", "+3", "--3", "abc", "", None],
@@ -113,14 +130,22 @@ def test_parse_quantities_rejects_anything_else(quantity: str | None) -> None:
         pipeline.parse_quantities(text_frame({"quantity": ["5", quantity]}))
 
 
-def test_parse_quantities_rejects_numbers_too_large_to_store() -> None:
-    with pytest.raises(ValueError, match="Quantity is too large to store"):
-        pipeline.parse_quantities(text_frame({"quantity": ["9" * 30]}))
+@pytest.mark.parametrize("column", ["unit_price", "discount"])
+@pytest.mark.parametrize("amount", ["9" * 400, "9" * 400 + ".50", "-" + "9" * 400])
+def test_amounts_reject_numbers_too_large_to_store(column: str, amount: str) -> None:
+    raw = text_frame({column: ["1.00", amount]})
+    parse = pipeline.parse_unit_prices if column == "unit_price" else pipeline.parse_discounts
+
+    with pytest.raises(ValueError, match=f"{column} is too large to store"):
+        parse(raw)
 
 
-def test_parse_unit_prices_rejects_numbers_too_large_to_store() -> None:
-    with pytest.raises(ValueError, match="unit_price is too large to store"):
-        pipeline.parse_unit_prices(text_frame({"unit_price": ["9" * 400]}))
+def test_amounts_accept_large_finite_numbers() -> None:
+    raw = text_frame({"unit_price": ["9" * 30, str(2**64)]})
+
+    result = pipeline.parse_unit_prices(raw)
+
+    assert result["unit_price"].tolist() == [1e30, float(2**64)]
 
 
 def test_parse_unit_prices_accepts_decimal_dots_and_commas() -> None:
@@ -195,9 +220,37 @@ def test_parse_discounts_turns_empty_into_zero() -> None:
     assert result["discount"].tolist() == [0.0, 5.0, 1.5]
 
 
-def test_parse_order_dates_rejects_other_formats() -> None:
-    with pytest.raises(ValueError):
-        pipeline.parse_order_dates(text_frame({"order_date": ["14/11/2026"]}))
+def test_parse_order_dates_reads_iso_dates() -> None:
+    raw = text_frame({"order_date": ["2026-01-05", " 2026-12-31 ", None]})
+
+    result = pipeline.parse_order_dates(raw)
+
+    assert result["order_date"].tolist()[:2] == [
+        pd.Timestamp(2026, 1, 5),
+        pd.Timestamp(2026, 12, 31),
+    ]
+    assert result["order_date"].isna().tolist() == [False, False, True]
+
+
+@pytest.mark.parametrize(
+    "date",
+    [
+        "2026-1-5",
+        "2026-01-5",
+        "26-01-05",
+        "20260105",
+        "2026/01/05",
+        "14/11/2026",
+        "2026-01-05T00:00",
+        "2026-01-05 00:00",
+        "2026-02-30",
+        "2026-13-01",
+        "",
+    ],
+)
+def test_parse_order_dates_rejects_anything_else(date: str) -> None:
+    with pytest.raises(ValueError, match="Order date is not a YYYY-MM-DD date"):
+        pipeline.parse_order_dates(text_frame({"order_date": ["2026-01-05", date]}))
 
 
 def test_drop_duplicate_lines_compares_all_values() -> None:
@@ -238,8 +291,55 @@ def test_lines_of_the_same_order_are_kept(tmp_path: Path) -> None:
 
     clean = pipeline.clean_sales(pipeline.load_sales(path))
 
-    assert clean["order_id"].tolist().count("SO-1") == 2
     assert len(clean) == 6
+    first_order = clean[clean["order_id"] == "SO-1"]
+    assert first_order["product"].tolist() == ["Mouse", "Keyboard"]
+    assert pipeline.add_revenue(first_order)["revenue"].sum() == 2 * 29.5 + 89.0
+
+
+def test_empty_blank_cells() -> None:
+    raw = text_frame({"region": [" ", "\t", " North ", None], "discount": ["  ", "5.00", "", "1"]})
+
+    result = pipeline.empty_blank_cells(raw)
+
+    assert result["region"].isna().tolist() == [True, True, False, True]
+    assert result["region"].tolist()[2] == " North "
+    assert result["discount"].isna().tolist() == [True, False, False, False]
+
+
+@pytest.mark.parametrize(
+    ("line", "column"),
+    [
+        ("   ,West,Mouse,1,29.50,,2026-01-06", "order_id"),
+        (",West,Mouse,1,29.50,,2026-01-06", "order_id"),
+        ("SO-6,   ,Mouse,1,29.50,,2026-01-06", "region"),
+        ("SO-6,,Mouse,1,29.50,,2026-01-06", "region"),
+        ("SO-6,West,  ,1,29.50,,2026-01-06", "product"),
+        ("SO-6,West,Mouse,1,29.50,,", "order_date"),
+    ],
+)
+def test_missing_or_blank_value_stops_the_pipeline(tmp_path: Path, line: str, column: str) -> None:
+    path = export_with(tmp_path, line)
+
+    with pytest.raises(ValueError, match=f"Missing values in {column}"):
+        pipeline.clean_sales(pipeline.load_sales(path))
+
+
+def test_blank_discount_and_price_count_as_empty(tmp_path: Path) -> None:
+    path = export_with(tmp_path, "SO-6,West,Mouse,1,  ,   ,2026-01-06")
+
+    clean = pipeline.clean_sales(pipeline.load_sales(path))
+
+    assert clean.iloc[-1][["unit_price", "discount"]].tolist() == [29.5, 0.0]
+
+
+@pytest.mark.parametrize("order_id", ["ORD-77", "12345", "so-10001"])
+def test_order_id_format_is_not_restricted(tmp_path: Path, order_id: str) -> None:
+    path = export_with(tmp_path, f"{order_id},West,Mouse,1,29.50,,2026-01-06")
+
+    clean = pipeline.clean_sales(pipeline.load_sales(path))
+
+    assert clean["order_id"].iloc[-1] == order_id
 
 
 def test_check_clean_accepts_clean_data(clean: pd.DataFrame) -> None:
@@ -292,6 +392,8 @@ def test_product_without_any_price_is_not_guessed(tmp_path: Path) -> None:
         "SO-6,West,Mouse,1,inf,,2026-01-06",
         "SO-6,West,Mouse,1,29.50,some,2026-01-06",
         "SO-6,West,Mouse,1,29.50,,06/01/2026",
+        "SO-6,West,Mouse,1,29.50,,2026-1-6",
+        "SO-6,West,Mouse,9223372036854775808,29.50,,2026-01-06",
         "SO-6,West,Mouse,1,-29.50,,2026-01-06",
         "SO-6,West,Mouse,1,29.50,30.00,2026-01-06",
     ],
